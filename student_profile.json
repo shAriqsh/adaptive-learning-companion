@@ -1,0 +1,16 @@
+{
+  "user_id": "student_01",
+  "mastery_map": {
+    "Algebra": {
+      "competency": 0.3,
+      "mistakes": []
+    },
+    "General": {
+      "competency": 0.3,
+      "mistakes": []
+    }
+  },
+  "preferences": {
+    "learning_style": "visual"
+  }
+}
