@@ -42,12 +42,15 @@ def update_profile(user_id: str, topic: str, diagnosis: str, style: str):
     # In a real app, the "Evaluator Agent" would score this precisely.
     current_score = data["mastery_map"][topic]["competency"]
     
-    if "correct" in diagnosis.lower() or "ready" in diagnosis.lower():
+    # Ensure diagnosis is a string for string operations
+    diag_str = str(diagnosis).lower()
+    
+    if "correct" in diag_str or "ready" in diag_str:
         new_score = min(1.0, current_score + 0.1)
     else:
         new_score = max(0.0, current_score - 0.05)
         # Record the mistake
-        if len(diagnosis) < 50: # Only save short diagnoses
+        if len(diag_str) < 50: # Only save short diagnoses
             data["mastery_map"][topic]["mistakes"].append(diagnosis)
             
     data["mastery_map"][topic]["competency"] = round(new_score, 2)

@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Config
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash") 
+llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0.7) 
 tools_list = [execute_python_code, fetch_curriculum_standard]
 curriculum_llm = llm.bind_tools(tools_list)
 
@@ -38,12 +38,20 @@ def node_diagnose(state: ALCState):
     
     analysis = llm.invoke([SystemMessage(content=prompt)] + history)
     
-    print(f"🕵️ [DIAGNOSIS]: {analysis.content}")
+    # Robustly extract text content if it's a list of blocks
+    content_text = analysis.content
+    if isinstance(analysis.content, list):
+        # Join all text parts if it's a list of content blocks
+        content_text = "\n".join(
+            block.get("text", "") for block in analysis.content if isinstance(block, dict) and "text" in block
+        )
+    
+    print(f"🕵️ [DIAGNOSIS]: {content_text}")
     
     return {
-        "latest_diagnosis": analysis.content,
+        "latest_diagnosis": content_text,
         # We assume the analysis might contain clues about style
-        "detected_learning_style": "visual" if "visual" in analysis.content.lower() else known_style
+        "detected_learning_style": "visual" if "visual" in content_text.lower() else known_style
     }
 
 # --- NODE 2: THE CURRICULUM MANAGER ---

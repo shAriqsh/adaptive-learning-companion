@@ -88,7 +88,12 @@ async def chat_endpoint(request: ChatRequest):
         for msg in reversed(ai_messages):
             # We look for an AI Message that has content and NO tool calls
             if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
-                last_response_text = msg.content
+                if isinstance(msg.content, list):
+                    last_response_text = "\n".join(
+                        block.get("text", "") for block in msg.content if isinstance(block, dict) and "text" in block
+                    )
+                else:
+                    last_response_text = msg.content
                 break
         
         # 6. Update Session Store
