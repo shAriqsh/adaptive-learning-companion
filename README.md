@@ -44,9 +44,7 @@ The system follows a cyclic graph-based logic:
 
 ### 2. Installation
 ```bash
-# Install dependencies (using uv or pip)
-pip install -r requirements.txt
-# OR
+# Install dependencies (using uv)
 uv sync
 ```
 
