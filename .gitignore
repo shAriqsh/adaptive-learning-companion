@@ -8,5 +8,28 @@ wheels/
 
 # Virtual environments
 .venv
+
 # Environment variables
 .env
+
+# Database
+*.db
+*.sqlite3
+
+# Test / cache
+.pytest_cache/
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+
+# Local databases
+chroma_db/
+alc_memory/
+
+# Customizations
+AGENTS.md
+spec.md
+todo.md
