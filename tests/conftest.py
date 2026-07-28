@@ -36,3 +36,24 @@ def db():
         session.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+
+@pytest.fixture()
+def checkpointer():
+    """Yield a fresh in-memory SqliteSaver for test isolation."""
+    from backend.app.agents.checkpointer import create_test_checkpointer
+
+    cp = create_test_checkpointer()
+    yield cp
+    try:
+        cp.conn.close()
+    except Exception:
+        pass
+
+
+@pytest.fixture()
+def memory_store():
+    """Yield a fresh InMemoryStore for test isolation."""
+    from backend.app.agents.checkpointer import create_test_store
+
+    return create_test_store()

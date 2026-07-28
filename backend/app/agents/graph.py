@@ -1,20 +1,22 @@
 """LangGraph orchestrator — builds and compiles the LearnMate AI graph.
 
-Phase 3 flow (updated from Phase 2):
+Graph flow:
 ```
 START → diagnostician → curriculum → [conditional on next_step]:
     tool_calls  → ToolNode → curriculum (loop)
     quiz        → question_generator → tutor → memory_saver → END
     evaluate    → evaluator → tutor → memory_saver → END
     reflect     → reflection → memory_saver → END
-    recommend   → recommend → memory_saver → END   ← NEW in Phase 3
+    recommend   → recommend → memory_saver → END
     explain     → tutor → memory_saver → END  (default)
 ```
 
-Phase 3 changes:
-- `diagnostician` node now uses ``make_diagnostician(db_session)`` factory
-  so it receives the DB session for RAG memory retrieval.
-- Added ``recommend`` node (Tavily resource search).
+Memory architecture (Phase 7):
+- **STM**: ``SqliteSaver`` checkpointer auto-saves/restores state per
+  ``thread_id``.  Conversations survive server restarts.
+- **LTM**: ``InMemoryStore`` provides cross-thread memory namespaced
+  per student.  Nodes access it via ``get_store()``.
+- DB session closures (diagnostician, memory_saver) are orthogonal.
 """
 
 from __future__ import annotations
@@ -79,13 +81,23 @@ def _should_continue_after_curriculum(state: ALCState) -> str:
 
 # ── Graph factory ────────────────────────────────────────────────────────
 
-def create_graph(db_session=None) -> "CompiledStateGraph":
+def create_graph(
+    db_session=None,
+    checkpointer=None,
+    store=None,
+) -> "CompiledStateGraph":
     """Build, wire, and compile the LearnMate AI state graph.
 
     Args:
         db_session: Optional SQLAlchemy session for the memory saver and
                     the diagnostician RAG retrieval.
                     Pass ``None`` to skip persistence (dev / tests).
+        checkpointer: Optional LangGraph checkpointer (STM).  When
+                      provided the graph auto-saves/restores state per
+                      ``thread_id`` in the invocation config.
+        store: Optional LangGraph BaseStore (LTM).  When provided,
+               nodes can access cross-thread memory via
+               ``get_store()``.
 
     Returns:
         A compiled LangGraph ``StateGraph`` ready for ``.invoke()`` or
@@ -94,7 +106,6 @@ def create_graph(db_session=None) -> "CompiledStateGraph":
     builder = StateGraph(ALCState)
 
     # ── Register nodes ────────────────────────────────────────────────
-    # Phase 3: diagnostician is now a factory — inject DB session for RAG
     builder.add_node("diagnostician", make_diagnostician(db_session))
     builder.add_node("curriculum", node_curriculum)
     builder.add_node("tools", ToolNode(_tools_list))
@@ -102,7 +113,7 @@ def create_graph(db_session=None) -> "CompiledStateGraph":
     builder.add_node("evaluator", node_evaluate)
     builder.add_node("question_generator", node_generate_question)
     builder.add_node("reflection", node_reflect)
-    builder.add_node("recommend", node_recommend)          # NEW Phase 3
+    builder.add_node("recommend", node_recommend)
     builder.add_node("memory_saver", make_memory_saver(db_session))
 
     # ── Wire edges ────────────────────────────────────────────────────
@@ -150,7 +161,14 @@ def create_graph(db_session=None) -> "CompiledStateGraph":
     # Recommend → memory_saver → END (persist session after recommendations)
     builder.add_edge("recommend", "memory_saver")
 
-    return builder.compile()
+    # ── Compile with optional memory primitives ───────────────────────
+    compile_kwargs = {}
+    if checkpointer is not None:
+        compile_kwargs["checkpointer"] = checkpointer
+    if store is not None:
+        compile_kwargs["store"] = store
+
+    return builder.compile(**compile_kwargs)
 
 
 # ── Module-level convenience ─────────────────────────────────────────────
@@ -158,19 +176,35 @@ def create_graph(db_session=None) -> "CompiledStateGraph":
 _cached_graph: "CompiledStateGraph | None" = None
 
 
-def get_graph(db_session=None) -> "CompiledStateGraph":
-    """Return a (optionally cached) compiled graph instance.
+def get_graph(db_session=None, *, use_memory: bool = True) -> "CompiledStateGraph":
+    """Return a compiled graph instance with memory primitives.
 
-    When ``db_session`` is ``None`` the graph is compiled once and
-    cached.  When a session is provided a fresh graph is always built
-    so that each request gets its own DB session.
+    When ``db_session`` is provided a fresh graph is always built so
+    that each request gets its own DB session.
+
+    When ``use_memory`` is ``True`` (default), the production
+    ``SqliteSaver`` checkpointer and ``InMemoryStore`` are attached.
+    Set to ``False`` for lightweight tests that don't need persistence.
     """
     global _cached_graph  # noqa: PLW0603
 
+    # Resolve memory primitives
+    checkpointer = None
+    store = None
+    if use_memory:
+        from backend.app.agents.checkpointer import (
+            get_checkpointer,
+            get_memory_store,
+        )
+        checkpointer = get_checkpointer()
+        store = get_memory_store()
+
     if db_session is not None:
         # Per-request graph with a live DB session — never cache.
-        return create_graph(db_session)
+        return create_graph(db_session, checkpointer=checkpointer, store=store)
 
     if _cached_graph is None:
-        _cached_graph = create_graph()
+        _cached_graph = create_graph(
+            checkpointer=checkpointer, store=store
+        )
     return _cached_graph

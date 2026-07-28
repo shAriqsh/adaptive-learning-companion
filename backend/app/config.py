@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # ── Debug ─────────────────────────────────────────────────────────────
     DEBUG: bool = True
 
+    # ── LangGraph Memory ─────────────────────────────────────────────────
+    CHECKPOINT_DB_PATH: str = "./checkpoints.db"
+    MESSAGE_HISTORY_LIMIT: int = 20
+
     # ── LangSmith Tracing ────────────────────────────────────────────────
     # These are read directly by langchain/langsmith via env vars.
     # Declaring them here for documentation and .env validation.

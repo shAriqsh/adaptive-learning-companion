@@ -29,24 +29,11 @@ from backend.app.services.session_service import (
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
-# ── In-memory session store (per-process, lost on restart) ────────────────
-# Maps student_id -> {messages, current_topic, ...}
-_active_sessions: dict[int, dict[str, Any]] = {}
-
-
-def _get_session_data(student_id: int) -> dict[str, Any]:
-    """Retrieve or initialise the in-memory session context."""
-    if student_id not in _active_sessions:
-        _active_sessions[student_id] = {
-            "messages": [],
-            "current_topic": "General",
-            "detected_learning_style": "unknown",
-            "latest_diagnosis": None,
-            "db_session_id": None,
-            "question_posed": None,
-            "correct_answer": None,
-        }
-    return _active_sessions[student_id]
+# ── Thread tracking (lightweight — actual state lives in checkpointer) ────
+# Maps student_id → db_session_id for the current active session.
+# Conversation state (messages, diagnosis, etc.) is persisted by the
+# SqliteSaver checkpointer and restored automatically per thread_id.
+_active_threads: dict[int, int] = {}
 
 
 def _detect_answer_intent(message: str, session_data: dict) -> bool:
@@ -82,11 +69,16 @@ def _detect_recommend_intent(message: str) -> bool:
 @router.post("", response_model=ChatResponse)
 @traceable(name="chat_endpoint", run_type="chain")
 async def chat(request: ChatRequest, db: DBSession = Depends(get_db)):
-    """Send a message to the AI tutor and receive a response."""
+    """Send a message to the AI tutor and receive a response.
+
+    Conversation state is managed by LangGraph's ``SqliteSaver``
+    checkpointer (STM).  Each student session gets a unique
+    ``thread_id`` so the graph auto-saves/restores state per thread.
+    """
 
     # ── Handle reset ──────────────────────────────────────────────────
     if request.reset:
-        _active_sessions.pop(request.student_id, None)
+        _active_threads.pop(request.student_id, None)
         return ChatResponse(
             response="Memory cleared. Ready for a new session!",
             current_topic="General",
@@ -98,38 +90,48 @@ async def chat(request: ChatRequest, db: DBSession = Depends(get_db)):
     student = get_or_create_student(db, request.student_id)
     mastery = get_mastery_summary(db, student.id)
 
-    # ── Retrieve / create in-memory session ───────────────────────────
-    session_data = _get_session_data(student.id)
-    history: list = session_data["messages"]
-
-    # Create a DB session record on first message
-    if session_data["db_session_id"] is None:
-        topic = request.topic or session_data["current_topic"]
+    # ── Get or create DB session → derive thread_id ───────────────────
+    if student.id not in _active_threads:
+        topic = request.topic or "General"
         db_sess = create_session(db, student.id, topic)
-        session_data["db_session_id"] = db_sess.id
+        _active_threads[student.id] = db_sess.id
 
-    # Override topic if provided
-    if request.topic:
-        session_data["current_topic"] = request.topic
+    db_session_id = _active_threads[student.id]
+    thread_id = f"student_{student.id}_session_{db_session_id}"
 
-    # Append user message
-    history.append(HumanMessage(content=request.message))
-
-    # ── Detect if this is an answer submission ────────────────────────
-    is_answer = _detect_answer_intent(request.message, session_data)
-    is_recommend = not is_answer and _detect_recommend_intent(request.message)
-
-    # ── Build graph input state ───────────────────────────────────────
+    # ── Build graph with checkpointer + store ─────────────────────────
     try:
         from backend.app.agents.graph import get_graph
 
-        # Use a per-request graph with the real DB session for persistence
         graph = get_graph(db_session=db)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to initialise agent graph: {exc}",
         )
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # ── Retrieve checkpoint state for context ─────────────────────────
+    # The checkpointer may already have state for this thread from a
+    # previous turn.  We read it to detect answer intent and to
+    # preserve fields like detected_learning_style across turns.
+    try:
+        snapshot = graph.get_state(config)
+        checkpoint_values = snapshot.values if snapshot.values else {}
+    except Exception:
+        checkpoint_values = {}
+
+    current_topic = request.topic or checkpoint_values.get(
+        "current_topic", "General"
+    )
+
+    # ── Detect intent using checkpointed question state ───────────────
+    is_answer = _detect_answer_intent(
+        request.message,
+        {"question_posed": checkpoint_values.get("question_posed")},
+    )
+    is_recommend = not is_answer and _detect_recommend_intent(request.message)
 
     if is_answer:
         next_step = "evaluate"
@@ -138,32 +140,82 @@ async def chat(request: ChatRequest, db: DBSession = Depends(get_db)):
     else:
         next_step = "explain"
 
+    # ── Trim old messages if checkpoint exceeds limit ───────────────────
+    # The checkpointer accumulates all messages.  When the history grows
+    # past MESSAGE_HISTORY_LIMIT, we prepend RemoveMessage objects so the
+    # add_messages reducer drops the oldest entries in this invocation.
+    from backend.app.config import settings
+    from langchain_core.messages import RemoveMessage
+
+    checkpoint_msgs = checkpoint_values.get("messages", [])
+    new_message = HumanMessage(content=request.message)
+
+    if len(checkpoint_msgs) > settings.MESSAGE_HISTORY_LIMIT:
+        msgs_to_remove = checkpoint_msgs[: -settings.MESSAGE_HISTORY_LIMIT]
+        trim_removals = [
+            RemoveMessage(id=m.id)
+            for m in msgs_to_remove
+            if hasattr(m, "id") and m.id
+        ]
+        input_messages = trim_removals + [new_message]
+    else:
+        input_messages = [new_message]
+
+    # ── Build graph input ─────────────────────────────────────────────
+    # Only the NEW message is passed — the checkpointer's add_messages
+    # reducer appends it to the accumulated history automatically.
+    # If trimming was needed, RemoveMessage objects precede the new msg.
+    # Fields like detected_learning_style are preserved from the
+    # checkpoint; skill_scores are refreshed from the DB each turn.
     graph_input = {
-        "messages": history,
+        "messages": input_messages,
         "student_id": student.id,
-        "session_id": session_data["db_session_id"],
-        "current_topic": session_data["current_topic"],
-        "current_difficulty": "easy",
-        "detected_learning_style": session_data["detected_learning_style"],
-        "latest_diagnosis": session_data["latest_diagnosis"],
+        "session_id": db_session_id,
+        "current_topic": current_topic,
+        "current_difficulty": checkpoint_values.get(
+            "current_difficulty", "easy"
+        ),
+        "detected_learning_style": checkpoint_values.get(
+            "detected_learning_style", "unknown"
+        ),
+        "latest_diagnosis": checkpoint_values.get("latest_diagnosis"),
         "skill_scores": mastery,
-        "question_posed": session_data.get("question_posed") if is_answer else None,
+        "question_posed": (
+            checkpoint_values.get("question_posed") if is_answer else None
+        ),
         "student_answer": request.message if is_answer else None,
-        "correct_answer": session_data.get("correct_answer") if is_answer else None,
+        "correct_answer": (
+            checkpoint_values.get("correct_answer") if is_answer else None
+        ),
         "is_answer_correct": None,
         "evaluation_feedback": None,
         "session_summary": None,
         "topics_learned": [],
         "topics_need_practice": [],
         "recommended_resources": [],
-        "retrieved_memories": [],
+        "retrieved_memories": checkpoint_values.get(
+            "retrieved_memories", []
+        ),
         "next_step": next_step,
     }
 
+    # ── Invoke graph (checkpointer auto-saves state per thread) ───────
     try:
-        final_state = graph.invoke(graph_input)
+        final_state = graph.invoke(graph_input, config=config)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}")
+
+    # ── Clear question state in checkpoint after evaluation ───────────
+    # Without this, the next turn would still see question_posed and
+    # wrongly detect an answer intent.
+    if is_answer:
+        try:
+            graph.update_state(
+                config,
+                {"question_posed": None, "correct_answer": None},
+            )
+        except Exception:
+            pass  # non-critical
 
     # ── Extract AI response ───────────────────────────────────────────
     ai_messages = final_state.get("messages", [])
@@ -181,24 +233,7 @@ async def chat(request: ChatRequest, db: DBSession = Depends(get_db)):
                 last_response = msg.content
             break
 
-    # ── Update in-memory session ──────────────────────────────────────
-    session_data["messages"] = ai_messages
-    session_data["current_topic"] = final_state.get("current_topic", session_data["current_topic"])
-    session_data["detected_learning_style"] = final_state.get(
-        "detected_learning_style", session_data["detected_learning_style"]
-    )
-    session_data["latest_diagnosis"] = final_state.get("latest_diagnosis")
-
-    # Track question state for answer detection on next turn
-    session_data["question_posed"] = final_state.get("question_posed")
-    session_data["correct_answer"] = final_state.get("correct_answer")
-
-    # Clear answer fields after evaluation so they don't persist
-    if is_answer:
-        session_data["question_posed"] = None
-        session_data["correct_answer"] = None
-
-    # Persist messages to DB session
+    # ── Persist messages to DB session (backward compat) ──────────────
     try:
         serialisable_msgs = [
             {"role": "human" if isinstance(m, HumanMessage) else "ai", "content": str(m.content)}
@@ -207,22 +242,23 @@ async def chat(request: ChatRequest, db: DBSession = Depends(get_db)):
         ]
         update_session(
             db,
-            session_data["db_session_id"],
+            db_session_id,
             messages_json=json.dumps(serialisable_msgs, default=str),
         )
     except Exception:
         pass  # non-critical
 
-    # ── Extract recommended resources ───────────────────────────────────
+    # ── Build response ────────────────────────────────────────────────
     raw_resources = final_state.get("recommended_resources", [])
     resources = raw_resources if raw_resources else None
+    response_topic = final_state.get("current_topic", current_topic)
 
     return ChatResponse(
         response=last_response,
-        current_topic=session_data["current_topic"],
+        current_topic=response_topic,
         current_difficulty=final_state.get("current_difficulty", "easy"),
-        learning_style=session_data["detected_learning_style"],
-        mastery_score=mastery.get(session_data["current_topic"]),
-        session_id=session_data["db_session_id"],
+        learning_style=final_state.get("detected_learning_style", "unknown"),
+        mastery_score=mastery.get(response_topic),
+        session_id=db_session_id,
         recommended_resources=resources,
     )

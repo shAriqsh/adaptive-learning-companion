@@ -59,8 +59,10 @@ def _fetch_long_term_memories(
 ) -> list[str]:
     """Retrieve relevant long-term memories for RAG injection.
 
-    Tries ChromaDB semantic retrieval first, then falls back to recent
-    SQLite memories if the vector store is unavailable.
+    Retrieval order:
+    1. **LangGraph Store** — structured cross-thread memories (always tried).
+    2. **ChromaDB** — semantic similarity retrieval (combined with Store).
+    3. **SQLite** — fallback to recent memory rows if ChromaDB unavailable.
 
     Args:
         student_id: The student to retrieve memories for.
@@ -71,7 +73,49 @@ def _fetch_long_term_memories(
     Returns:
         A list of memory content strings (may be empty).
     """
-    # ── 1. Try ChromaDB semantic retrieval ───────────────────────────
+    memories: list[str] = []
+
+    # ── 0. LangGraph Store (structured cross-thread memories) ─────────
+    try:
+        from langgraph.config import get_store
+
+        store = get_store()
+        if store is not None:
+            ns = (f"student_{student_id}", "memories")
+            for key in ("learning_style", "weaknesses", "strengths", "context"):
+                item = store.get(ns, key)
+                if item and item.value:
+                    val = item.value
+                    if key == "learning_style":
+                        memories.append(
+                            f"Preferred learning style: {val.get('style', 'unknown')}"
+                        )
+                    elif key == "weaknesses":
+                        topics = val.get("topics", [])
+                        if topics:
+                            memories.append(
+                                f"Needs practice: {', '.join(topics)}"
+                            )
+                    elif key == "strengths":
+                        topics = val.get("topics", [])
+                        if topics:
+                            memories.append(
+                                f"Learned: {', '.join(topics)}"
+                            )
+                    elif key == "context":
+                        diag = val.get("diagnosis", "")
+                        if diag:
+                            memories.append(f"Prior diagnosis: {diag[:300]}")
+            if memories:
+                logger.info(
+                    "🔍 [LTM] Injecting %d Store memories for student %s",
+                    len(memories),
+                    student_id,
+                )
+    except Exception:
+        logger.debug("🔍 [LTM] Store retrieval skipped.", exc_info=True)
+
+    # ── 1. ChromaDB semantic retrieval (combined with Store results) ──
     try:
         from backend.app.services.chroma_service import retrieve_memories
         results = retrieve_memories(student_id=student_id, query=topic, k=k)
@@ -81,9 +125,14 @@ def _fetch_long_term_memories(
                 len(results),
                 student_id,
             )
-            return results
+            memories.extend(results)
+            return memories
     except Exception:
         logger.debug("🔍 [RAG] ChromaDB retrieval skipped.", exc_info=True)
+
+    # If Store returned results but ChromaDB didn't, still return them
+    if memories:
+        return memories
 
     # ── 2. SQLite fallback — get most recent memories ─────────────────
     if db_session is not None:

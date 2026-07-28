@@ -1,8 +1,13 @@
-"""Memory Saver node — persists session data to the database.
+"""Memory Saver node — persists session data across three layers.
 
-This is a side-effect-only node: it saves session summaries, updates
-mastery scores, and stores memory fragments, but returns an empty dict
-so it doesn't alter the graph state.
+This is a side-effect-only node that writes to:
+
+1. **SQLite** (relational) — session summary, skill scores, memory fragments.
+2. **ChromaDB** (semantic) — embedded memory fragments for RAG retrieval.
+3. **LangGraph Store** (LTM) — cross-thread key-value memories accessible
+   from any session via ``get_store()``.
+
+Returns an empty dict so it doesn't alter the graph state.
 """
 
 from __future__ import annotations
@@ -137,6 +142,61 @@ def make_memory_saver(db_session=None):
                 db_session.rollback()
             except Exception:
                 pass
+
+        # ── 4. Write cross-thread memories to LangGraph Store (LTM) ───
+        # The store is injected at graph compile time via
+        # builder.compile(store=...) and accessed here with get_store().
+        # Namespace: ("student_{id}", "memories")  — shared across threads.
+        try:
+            from langgraph.config import get_store
+
+            store = get_store()
+            if store is not None:
+                ns = (f"student_{student_id}", "memories")
+                now_iso = datetime.now(timezone.utc).isoformat()
+
+                if style != "unknown":
+                    store.put(
+                        ns,
+                        "learning_style",
+                        {"style": style, "topic": topic, "updated_at": now_iso},
+                    )
+                if topics_need_practice:
+                    store.put(
+                        ns,
+                        "weaknesses",
+                        {"topics": topics_need_practice, "updated_at": now_iso},
+                    )
+                if topics_learned:
+                    store.put(
+                        ns,
+                        "strengths",
+                        {"topics": topics_learned, "updated_at": now_iso},
+                    )
+                if diagnosis:
+                    store.put(
+                        ns,
+                        "context",
+                        {"diagnosis": diagnosis[:500], "topic": topic, "updated_at": now_iso},
+                    )
+                if summary and session_id:
+                    store.put(
+                        ns,
+                        f"session_summary_{session_id}",
+                        {"summary": summary, "topic": topic, "updated_at": now_iso},
+                    )
+
+                logger.info(
+                    "💾 [LTM] Wrote cross-thread memories to Store for student %s",
+                    student_id,
+                )
+        except Exception:
+            # Store may not be configured (tests, no-store graph).
+            logger.debug(
+                "💾 [LTM] Store write skipped for student %s",
+                student_id,
+                exc_info=True,
+            )
 
         return {}
 
