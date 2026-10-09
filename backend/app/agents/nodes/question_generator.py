@@ -8,20 +8,12 @@ and its correct answer.
 from __future__ import annotations
 
 import json
-import os
-
-from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from backend.app.agents.state import ALCState
-
-load_dotenv(override=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-    temperature=0.8,  # slightly higher for creative question variety
-)
+from backend.app.llm import get_llm
+from backend.app.utils.content import extract_text
 
 
 def _select_difficulty(mastery: float) -> str:
@@ -50,7 +42,7 @@ def _gather_previous_mistakes(messages: list, limit: int = 5) -> str:
     return "\n".join(mistakes) if mistakes else "No recent mistakes recorded."
 
 
-def node_generate_question(state: ALCState) -> dict:
+def node_generate_question(state: ALCState, llm: BaseChatModel | None = None) -> dict:
     """Generate an adaptive practice question for the student.
 
     Difficulty scales with mastery.  The prompt asks for both the
@@ -101,16 +93,13 @@ Guidelines:
 Respond ONLY with the JSON object — no markdown fences, no extra text.
 """
 
-    response = llm.invoke([
+    active_llm = llm if llm is not None else get_llm("question_generator")
+    response = active_llm.invoke([
         SystemMessage(content=prompt),
         HumanMessage(content="Generate the practice question now."),
     ])
 
-    content = response.content
-    if isinstance(content, list):
-        content = "\n".join(
-            b.get("text", "") for b in content if isinstance(b, dict)
-        )
+    content = extract_text(response.content)
 
     # Parse structured response
     try:

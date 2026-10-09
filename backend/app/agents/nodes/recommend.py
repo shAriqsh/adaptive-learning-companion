@@ -15,7 +15,7 @@ from backend.app.agents.state import ALCState
 logger = logging.getLogger(__name__)
 
 
-def node_recommend(state: ALCState) -> dict:
+def node_recommend(state: ALCState, llm=None) -> dict:
     """Search for learning resources relevant to the student's current topic.
 
     Args:

@@ -7,23 +7,15 @@ topics that need more practice, and produce a concise session summary.
 from __future__ import annotations
 
 import json
-import os
-
-from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from backend.app.agents.state import ALCState
-
-load_dotenv(override=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-    temperature=0.5,
-)
+from backend.app.llm import get_llm
+from backend.app.utils.content import extract_text
 
 
-def node_reflect(state: ALCState) -> dict:
+def node_reflect(state: ALCState, llm: BaseChatModel | None = None) -> dict:
     """Analyse the full conversation and produce session reflections.
 
     Uses the LLM to identify what was learned, what needs practice,
@@ -74,16 +66,13 @@ Analyse the session and produce a JSON object with exactly these keys:
 Respond ONLY with the JSON object — no markdown fences, no extra text.
 """
 
-    response = llm.invoke([
+    active_llm = llm if llm is not None else get_llm("reflection")
+    response = active_llm.invoke([
         SystemMessage(content=prompt),
         HumanMessage(content="Analyse the session and produce the JSON summary."),
     ])
 
-    content = response.content
-    if isinstance(content, list):
-        content = "\n".join(
-            b.get("text", "") for b in content if isinstance(b, dict)
-        )
+    content = extract_text(response.content)
 
     # Parse the structured response
     try:

@@ -10,19 +10,13 @@ from __future__ import annotations
 import json
 import os
 
-from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from backend.app.agents.state import ALCState
 from backend.app.agents.tools.math_evaluator import evaluate_math_answer
-
-load_dotenv(override=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-    temperature=0.3,  # low temperature for more deterministic evaluation
-)
+from backend.app.llm import get_llm
+from backend.app.utils.content import extract_text
 
 # Mastery score deltas
 _CORRECT_DELTA = 5
@@ -35,7 +29,10 @@ def _try_math_eval(student_answer: str, correct_answer: str) -> dict | None:
         raw = evaluate_math_answer.invoke(
             {"student_answer": student_answer, "correct_answer": correct_answer}
         )
-        return json.loads(raw)
+        data = json.loads(raw)
+        if "Could not parse" in data.get("explanation", ""):
+            return None
+        return data
     except Exception:  # noqa: BLE001
         return None
 
@@ -45,6 +42,7 @@ def _llm_eval(
     correct_answer: str,
     question: str,
     topic: str,
+    llm: BaseChatModel | None = None,
 ) -> dict:
     """Use the LLM to evaluate a free-form (non-math) answer."""
     prompt = f"""You are an answer evaluator for an adaptive learning system.
@@ -67,14 +65,11 @@ Evaluate the student's answer.  Respond ONLY with valid JSON:
   "explanation": "Brief explanation of why the answer is correct or incorrect"
 }}
 """
-    response = llm.invoke([SystemMessage(content=prompt)])
+    active_llm = llm if llm is not None else get_llm("evaluator")
+    response = active_llm.invoke([SystemMessage(content=prompt)])
 
     # Parse the LLM's JSON response
-    content = response.content
-    if isinstance(content, list):
-        content = "\n".join(
-            b.get("text", "") for b in content if isinstance(b, dict)
-        )
+    content = extract_text(response.content)
 
     try:
         # Strip markdown fences if present
@@ -92,7 +87,7 @@ Evaluate the student's answer.  Respond ONLY with valid JSON:
         }
 
 
-def node_evaluate(state: ALCState) -> dict:
+def node_evaluate(state: ALCState, llm: BaseChatModel | None = None) -> dict:
     """Evaluate the student's submitted answer.
 
     Tries symbolic math evaluation first, then falls back to LLM-based
@@ -127,6 +122,7 @@ def node_evaluate(state: ALCState) -> dict:
             correct_answer=correct_answer or "N/A",
             question=question_posed or "N/A",
             topic=topic,
+            llm=llm,
         )
 
     is_correct = bool(result.get("correct", False))

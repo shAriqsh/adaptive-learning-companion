@@ -33,3 +33,6 @@ alc_memory/
 AGENTS.md
 spec.md
 todo.md
+
+.agents/
+.scratch/

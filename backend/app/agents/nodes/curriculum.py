@@ -7,29 +7,18 @@ Can invoke tools (python_repl, curriculum_fetcher) to gather data.
 
 from __future__ import annotations
 
-import os
-
-from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from backend.app.agents.state import ALCState
 from backend.app.agents.tools.curriculum_fetcher import fetch_curriculum_standard
 from backend.app.agents.tools.python_repl import execute_python_code
+from backend.app.llm import get_llm
 
-load_dotenv(override=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-    temperature=0.7,
-)
-
-# Bind tools so the LLM can request tool calls
 tools_list = [execute_python_code, fetch_curriculum_standard]
-curriculum_llm = llm.bind_tools(tools_list)
 
 
-def node_curriculum(state: ALCState) -> dict:
+def node_curriculum(state: ALCState, llm: BaseChatModel | None = None) -> dict:
     """Design the next learning step based on diagnosis and skill scores.
 
     The Curriculum Manager acts as the orchestrator between content
@@ -80,7 +69,13 @@ Write natural-language instructions that the Tutor node will use to craft its re
 Do NOT speak directly to the student — you are talking to the Tutor.
 """
 
-    response = curriculum_llm.invoke(
+    active_llm = llm if llm is not None else get_llm("curriculum")
+    try:
+        active_llm = active_llm.bind_tools(tools_list)
+    except (NotImplementedError, AttributeError):
+        pass
+
+    response = active_llm.invoke(
         [SystemMessage(content=prompt)] + messages
     )
 

@@ -1,11 +1,7 @@
 """Memory Saver node — persists session data across three layers.
 
-This is a side-effect-only node that writes to:
-
-1. **SQLite** (relational) — session summary, skill scores, memory fragments.
-2. **ChromaDB** (semantic) — embedded memory fragments for RAG retrieval.
-3. **LangGraph Store** (LTM) — cross-thread key-value memories accessible
-   from any session via ``get_store()``.
+This is a side-effect-only node that extracts memory facts from the graph state
+and delegates persistence to ``MemoryWriter`` (SQLite, ChromaDB, and LangGraph Store).
 
 Returns an empty dict so it doesn't alter the graph state.
 """
@@ -13,195 +9,42 @@ Returns an empty dict so it doesn't alter the graph state.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from backend.app.agents.state import ALCState
+from backend.app.memory.writer import MemoryFacts, MemoryWriter
 
 logger = logging.getLogger(__name__)
 
 
-def make_memory_saver(db_session=None):
-    """Create a ``node_memory_saver`` closure bound to a DB session.
+def make_memory_saver(db_session=None, memory_writer: MemoryWriter | None = None):
+    """Create a ``node_memory_saver`` closure bound to a DB session or MemoryWriter.
 
-    Using a closure lets us inject the database session at graph-build
+    Using a closure lets us inject the database session or MemoryWriter at graph-build
     time without polluting the LangGraph state with ORM objects.
 
     Args:
         db_session: A SQLAlchemy ``Session`` instance, or ``None`` for
                     a no-op (useful in tests and early development).
+        memory_writer: Optional pre-configured ``MemoryWriter`` instance.
+                       If not provided, one is instantiated from ``db_session``.
 
     Returns:
         A node function ``(ALCState) -> dict``.
     """
+    writer = memory_writer if memory_writer is not None else MemoryWriter(db_session=db_session)
 
     def node_memory_saver(state: ALCState) -> dict:
-        """Persist session data to the database (side-effect only).
+        """Persist session data via MemoryWriter (side-effect only).
 
         Returns an empty dict — this node does not modify graph state.
         """
         student_id = state.get("student_id", 0)
-        session_id = state.get("session_id")
-        topic = state.get("current_topic", "General")
-        diagnosis = state.get("latest_diagnosis", "")
-        style = state.get("detected_learning_style", "unknown")
-        summary = state.get("session_summary", "")
-        skill_scores = state.get("skill_scores", {})
-        topics_learned = state.get("topics_learned", [])
-        topics_need_practice = state.get("topics_need_practice", [])
-
-        if db_session is None:
-            logger.info(
-                "💾 [MEMORY] No DB session — skipping persistence. "
-                "Student %s, topic=%s, style=%s",
-                student_id,
-                topic,
-                style,
-            )
-            return {}
-
-        try:
-            # ── 1. Update session summary ─────────────────────────────
-            from backend.app.models.session import Session as SessionModel
-
-            if session_id:
-                sess = db_session.get(SessionModel, session_id)
-                if sess:
-                    if summary:
-                        sess.summary = summary
-                    sess.ended_at = datetime.now(timezone.utc)
-                    logger.info(
-                        "💾 [MEMORY] Saved session summary for session_id=%s",
-                        session_id,
-                    )
-
-            # ── 2. Update skill mastery scores ────────────────────────
-            from backend.app.models.skill import Skill
-
-            for skill_name, score in skill_scores.items():
-                skill = (
-                    db_session.query(Skill)
-                    .filter_by(student_id=student_id, skill_name=skill_name)
-                    .first()
-                )
-                if skill:
-                    skill.mastery_score = max(0.0, min(100.0, float(score)))
-                    skill.updated_at = datetime.now(timezone.utc)
-            logger.info(
-                "💾 [MEMORY] Updated skill scores for student %s: %s",
-                student_id,
-                skill_scores,
-            )
-
-            # ── 3. Store memory fragments ─────────────────────────────
-            from backend.app.models.memory import Memory
-
-            def _store_and_embed(mtype: str, content: str) -> None:
-                """Write to SQLite and index in ChromaDB."""
-                mem = Memory(student_id=student_id, memory_type=mtype, content=content)
-                db_session.add(mem)
-                db_session.flush()  # Assign mem.id before embedding
-                try:
-                    from backend.app.services.chroma_service import embed_memory
-                    embed_memory(student_id, mtype, content, memory_id=mem.id)
-                except Exception:
-                    logger.debug("💾 [MEMORY] ChromaDB embed skipped for %s", mtype)
-
-            if topics_need_practice:
-                _store_and_embed(
-                    "weakness",
-                    f"Needs practice: {', '.join(topics_need_practice)}",
-                )
-            if topics_learned:
-                _store_and_embed(
-                    "strength",
-                    f"Learned: {', '.join(topics_learned)}",
-                )
-            if style != "unknown":
-                _store_and_embed(
-                    "preference",
-                    f"Preferred learning style: {style}",
-                )
-            if diagnosis:
-                _store_and_embed(
-                    "context",
-                    f"Diagnosis: {diagnosis[:500]}",
-                )
-            logger.info(
-                "💾 [MEMORY] Stored memory fragments for student %s",
-                student_id,
-            )
-
-            db_session.commit()
-
-        except Exception:
-            logger.exception(
-                "💾 [MEMORY] Error saving session data for student %s",
-                student_id,
-            )
-            try:
-                db_session.rollback()
-            except Exception:
-                pass
-
-        # ── 4. Write cross-thread memories to LangGraph Store (LTM) ───
-        # The store is injected at graph compile time via
-        # builder.compile(store=...) and accessed here with get_store().
-        # Namespace: ("student_{id}", "memories")  — shared across threads.
-        try:
-            from langgraph.config import get_store
-
-            store = get_store()
-            if store is not None:
-                ns = (f"student_{student_id}", "memories")
-                now_iso = datetime.now(timezone.utc).isoformat()
-
-                if style != "unknown":
-                    store.put(
-                        ns,
-                        "learning_style",
-                        {"style": style, "topic": topic, "updated_at": now_iso},
-                    )
-                if topics_need_practice:
-                    store.put(
-                        ns,
-                        "weaknesses",
-                        {"topics": topics_need_practice, "updated_at": now_iso},
-                    )
-                if topics_learned:
-                    store.put(
-                        ns,
-                        "strengths",
-                        {"topics": topics_learned, "updated_at": now_iso},
-                    )
-                if diagnosis:
-                    store.put(
-                        ns,
-                        "context",
-                        {"diagnosis": diagnosis[:500], "topic": topic, "updated_at": now_iso},
-                    )
-                if summary and session_id:
-                    store.put(
-                        ns,
-                        f"session_summary_{session_id}",
-                        {"summary": summary, "topic": topic, "updated_at": now_iso},
-                    )
-
-                logger.info(
-                    "💾 [LTM] Wrote cross-thread memories to Store for student %s",
-                    student_id,
-                )
-        except Exception:
-            # Store may not be configured (tests, no-store graph).
-            logger.debug(
-                "💾 [LTM] Store write skipped for student %s",
-                student_id,
-                exc_info=True,
-            )
-
+        facts = MemoryFacts.from_state(state)
+        writer.persist(student_id, facts)
         return {}
 
     return node_memory_saver
 
 
-# Convenience: a no-op saver for use when no DB is available.
+# Convenience: a default saver for use when no DB is available.
 node_memory_saver = make_memory_saver(db_session=None)

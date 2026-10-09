@@ -57,3 +57,73 @@ def memory_store():
     from backend.app.agents.checkpointer import create_test_store
 
     return create_test_store()
+
+
+@pytest.fixture()
+def memory_writer(db):
+    """Yield a MemoryWriter configured with in-memory SQLite, mock ChromaDB, and InMemoryStore."""
+    from unittest.mock import MagicMock
+    from backend.app.memory.writer import MemoryWriter, ChromaAdapter, StoreAdapter
+    from backend.app.agents.checkpointer import create_test_store
+
+    mock_embed = MagicMock()
+    chroma_adapter = ChromaAdapter(embed_fn=mock_embed)
+    store = create_test_store()
+    store_adapter = StoreAdapter(store=store)
+
+    writer = MemoryWriter(
+        db_session=db,
+        chroma_adapter=chroma_adapter,
+        store_adapter=store_adapter,
+    )
+    writer._test_store = store
+    writer._mock_embed = mock_embed
+    return writer
+
+
+@pytest.fixture()
+def memory_reader(db, memory_writer):
+    """Yield a MemoryReader wired to the same test backends as memory_writer."""
+    from backend.app.memory.reader import MemoryReader
+
+    def _mock_retrieve_chroma(student_id: int, query: str, k: int = 5) -> list[str]:
+        return [
+            call.kwargs.get("content")
+            for call in memory_writer._mock_embed.call_args_list
+            if call.kwargs.get("student_id") == student_id and call.kwargs.get("content")
+        ][:k]
+
+    return MemoryReader(
+        db_session=db,
+        chroma_service=_mock_retrieve_chroma,
+        store=memory_writer._test_store,
+    )
+
+
+
+@pytest.fixture()
+def fake_llm():
+    """Yield a deterministic FakeListChatModel returning canned responses."""
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    return FakeListChatModel(
+        responses=[
+            '{"correct": true, "explanation": "Spot on!"}',
+            '{"question": "What is 2+2?", "correct_answer": "4", "hint": "Basic addition"}',
+            '{"session_summary": "Great session.", "topics_learned": ["Addition"], "topics_need_practice": []}',
+            "You are doing wonderfully! Let's continue.",
+        ]
+    )
+
+
+@pytest.fixture()
+def fake_llm_factory():
+    """Factory fixture returning a function to create FakeListChatModel with custom responses."""
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    def _create(responses: list[str]) -> FakeListChatModel:
+        return FakeListChatModel(responses=responses)
+
+    return _create
+
+

@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -43,7 +42,6 @@ from backend.app.agents.tools.python_repl import execute_python_code
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
-load_dotenv(override=True)
 
 
 # ── Tools available to the Curriculum Manager ────────────────────────────

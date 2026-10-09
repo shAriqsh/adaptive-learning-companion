@@ -7,20 +7,11 @@ results are available.
 
 from __future__ import annotations
 
-import os
-
-from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from backend.app.agents.state import ALCState
-
-load_dotenv(override=True)
-
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-    temperature=0.7,
-)
+from backend.app.llm import get_llm
 
 
 # ── Style-specific prompt fragments ─────────────────────────────────────
@@ -55,7 +46,7 @@ _STYLE_PROMPTS: dict[str, str] = {
 }
 
 
-def node_tutor(state: ALCState) -> dict:
+def node_tutor(state: ALCState, llm: BaseChatModel | None = None) -> dict:
     """Generate the student-facing tutoring response.
 
     Takes the Curriculum Manager's instructions (in the latest messages),
@@ -129,7 +120,8 @@ def node_tutor(state: ALCState) -> dict:
 Your colleague (the Curriculum Manager) has left instructions in the recent messages. Follow them to craft your response to the student.
 """
 
-    response = llm.invoke(
+    active_llm = llm if llm is not None else get_llm("tutor")
+    response = active_llm.invoke(
         [SystemMessage(content=prompt)] + state["messages"]
     )
 
